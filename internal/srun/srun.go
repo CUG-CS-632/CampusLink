@@ -1,6 +1,7 @@
 package srun
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/md5"
 	"crypto/sha1"
@@ -10,54 +11,88 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 )
 
 const (
-	DefaultHost   = "nap.cug.edu.cn"
-	DefaultACID   = "1"
-	DefaultN      = "200"
-	DefaultType   = "1"
-	DefaultEnc    = "srun_bx1"
-	defaultUA     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
-	alpha         = "LVoJPiCN2R8G90yg+hmFHuacZ1OWMnrsSTXkYpUq/3dlbfKwv6xztjI7DeBE45QA"
-	standardAlpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	DefaultHost                   = "nap.cug.edu.cn"
+	DefaultACID                   = "1"
+	DefaultN                      = "200"
+	DefaultType                   = "1"
+	DefaultEnc                    = "srun_bx1"
+	DefaultBaseURL                = "http://" + DefaultHost
+	DefaultMaxResponseBytes int64 = 1 << 20
+	maxResponseBytes        int64 = 16 << 20
+	alpha                         = "LVoJPiCN2R8G90yg+hmFHuacZ1OWMnrsSTXkYpUq/3dlbfKwv6xztjI7DeBE45QA"
+	standardAlpha                 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+)
+
+var (
+	ipPattern    = regexp.MustCompile(`(?:\bip\b|["']ip["'])\s*:\s*["']([^"']+)["']`)
+	jsonpPattern = regexp.MustCompile(`(?s)^[A-Za-z_$][A-Za-z0-9_$.]*\s*\((.*)\)\s*;?$`)
 )
 
 type Config struct {
-	Host    string
-	ACID    string
-	N       string
-	Type    string
-	Enc     string
-	Timeout time.Duration
+	BaseURL string
+	// Host is retained for the original configuration API and overrides an empty or default BaseURL.
+	Host             string
+	ACID             string
+	N                string
+	Type             string
+	Enc              string
+	Timeout          time.Duration
+	MaxResponseBytes int64
 }
 
 func DefaultConfig() Config {
 	return Config{
-		Host:    DefaultHost,
-		ACID:    DefaultACID,
-		N:       DefaultN,
-		Type:    DefaultType,
-		Enc:     DefaultEnc,
-		Timeout: 8 * time.Second,
+		BaseURL:          DefaultBaseURL,
+		ACID:             DefaultACID,
+		N:                DefaultN,
+		Type:             DefaultType,
+		Enc:              DefaultEnc,
+		Timeout:          8 * time.Second,
+		MaxResponseBytes: DefaultMaxResponseBytes,
 	}
 }
 
 type Client struct {
-	config Config
-	http   *http.Client
+	config  Config
+	baseURL *url.URL
+	http    *http.Client
 }
 
 func NewClient(config Config) (*Client, error) {
-	if config.Host == "" {
-		config.Host = DefaultHost
+	baseURLValue := strings.TrimSpace(config.BaseURL)
+	hostValue := strings.TrimSpace(config.Host)
+	if hostValue != "" && (baseURLValue == "" || baseURLValue == DefaultBaseURL) {
+		baseURLValue = hostValue
 	}
+	if baseURLValue == "" {
+		baseURLValue = DefaultBaseURL
+	}
+	if !strings.Contains(baseURLValue, "://") {
+		baseURLValue = "http://" + baseURLValue
+	}
+	baseURL, err := url.Parse(baseURLValue)
+	if err != nil {
+		return nil, fmt.Errorf("invalid portal base URL: %w", err)
+	}
+	if (baseURL.Scheme != "http" && baseURL.Scheme != "https") || baseURL.Host == "" {
+		return nil, errors.New("portal base URL must use http or https and include a host")
+	}
+	if baseURL.User != nil || baseURL.RawQuery != "" || baseURL.Fragment != "" {
+		return nil, errors.New("portal base URL must not contain user info, query parameters, or a fragment")
+	}
+	config.BaseURL = strings.TrimRight(baseURL.String(), "/")
+	config.Host = ""
 	if config.ACID == "" {
 		config.ACID = DefaultACID
 	}
@@ -70,8 +105,15 @@ func NewClient(config Config) (*Client, error) {
 	if config.Enc == "" {
 		config.Enc = DefaultEnc
 	}
-	if config.Timeout <= 0 {
+	if config.Timeout == 0 {
 		config.Timeout = 8 * time.Second
+	} else if config.Timeout < 0 {
+		return nil, errors.New("timeout must be greater than zero")
+	}
+	if config.MaxResponseBytes == 0 {
+		config.MaxResponseBytes = DefaultMaxResponseBytes
+	} else if config.MaxResponseBytes < 0 || config.MaxResponseBytes > maxResponseBytes {
+		return nil, fmt.Errorf("max response size must be between 1 and %d bytes", maxResponseBytes)
 	}
 
 	jar, err := cookiejar.New(nil)
@@ -80,7 +122,8 @@ func NewClient(config Config) (*Client, error) {
 	}
 
 	return &Client{
-		config: config,
+		config:  config,
+		baseURL: baseURL,
 		http: &http.Client{
 			Jar:     jar,
 			Timeout: config.Timeout,
@@ -89,6 +132,13 @@ func NewClient(config Config) (*Client, error) {
 }
 
 func (c *Client) Login(username, password, ip string) (map[string]any, error) {
+	return c.LoginContext(context.Background(), username, password, ip)
+}
+
+func (c *Client) LoginContext(ctx context.Context, username, password, ip string) (map[string]any, error) {
+	if ctx == nil {
+		return nil, errors.New("context is required")
+	}
 	if username == "" {
 		return nil, errors.New("username is required")
 	}
@@ -98,14 +148,16 @@ func (c *Client) Login(username, password, ip string) (map[string]any, error) {
 
 	var err error
 	if ip == "" {
-		ip, err = c.DiscoverIP()
+		ip, err = c.DiscoverIPContext(ctx)
 		if err != nil {
 			return nil, err
 		}
+	} else if net.ParseIP(ip) == nil {
+		return nil, fmt.Errorf("invalid client IP %q", ip)
 	}
 
 	callback := fmt.Sprintf("jQuery%d", nowMS())
-	challengeText, err := c.get("/cgi-bin/get_challenge", url.Values{
+	challengeText, err := c.get(ctx, "/cgi-bin/get_challenge", url.Values{
 		"callback": []string{callback},
 		"username": []string{username},
 		"ip":       []string{ip},
@@ -131,7 +183,8 @@ func (c *Client) Login(username, password, ip string) (map[string]any, error) {
 	}
 	chksum := Checksum(token, username, hmd5, ip, info, c.config)
 
-	return c.getJSONP("/cgi-bin/srun_portal", url.Values{
+	portalOS, portalName := portalPlatform()
+	return c.getJSONP(ctx, "/cgi-bin/srun_portal", url.Values{
 		"callback":     []string{callback},
 		"action":       []string{"login"},
 		"username":     []string{username},
@@ -142,15 +195,22 @@ func (c *Client) Login(username, password, ip string) (map[string]any, error) {
 		"info":         []string{info},
 		"n":            []string{c.config.N},
 		"type":         []string{c.config.Type},
-		"os":           []string{"windows+10"},
-		"name":         []string{"windows"},
+		"os":           []string{portalOS},
+		"name":         []string{portalName},
 		"double_stack": []string{"0"},
 		"_":            []string{fmt.Sprintf("%d", nowMS())},
 	})
 }
 
 func (c *Client) DiscoverIP() (string, error) {
-	html, err := c.get("/srun_portal_pc", url.Values{
+	return c.DiscoverIPContext(context.Background())
+}
+
+func (c *Client) DiscoverIPContext(ctx context.Context) (string, error) {
+	if ctx == nil {
+		return "", errors.New("context is required")
+	}
+	html, err := c.get(ctx, "/srun_portal_pc", url.Values{
 		"ac_id": []string{c.config.ACID},
 		"theme": []string{"pro"},
 	})
@@ -158,47 +218,55 @@ func (c *Client) DiscoverIP() (string, error) {
 		return "", err
 	}
 
-	match := regexp.MustCompile(`\bip\s*:\s*"([^"]+)"`).FindStringSubmatch(html)
+	match := ipPattern.FindStringSubmatch(html)
 	if len(match) < 2 {
 		return "", errors.New("cannot find client ip from portal page; pass --ip")
+	}
+	if net.ParseIP(match[1]) == nil {
+		return "", fmt.Errorf("portal returned invalid client IP %q; pass --ip", match[1])
 	}
 	return match[1], nil
 }
 
-func (c *Client) getJSONP(path string, query url.Values) (map[string]any, error) {
-	text, err := c.get(path, query)
+func (c *Client) getJSONP(ctx context.Context, path string, query url.Values) (map[string]any, error) {
+	text, err := c.get(ctx, path, query)
 	if err != nil {
 		return nil, err
 	}
 	return ParseJSONP(text)
 }
 
-func (c *Client) get(path string, query url.Values) (string, error) {
-	u := url.URL{
-		Scheme:   "http",
-		Host:     c.config.Host,
-		Path:     path,
-		RawQuery: query.Encode(),
-	}
+func (c *Client) get(ctx context.Context, path string, query url.Values) (string, error) {
+	u := *c.baseURL
+	u.Path = strings.TrimRight(u.Path, "/") + "/" + strings.TrimLeft(path, "/")
+	u.RawPath = ""
+	u.RawQuery = query.Encode()
 
-	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("create portal request for %s: %w", u.Path, err)
 	}
-	req.Header.Set("User-Agent", defaultUA)
+	req.Header.Set("User-Agent", defaultUserAgent())
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("portal connection failed: %w", err)
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = urlErr.Err
+		}
+		return "", fmt.Errorf("portal request %s failed: %w", u.Path, err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, c.config.MaxResponseBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("read portal response: %w", err)
 	}
+	if int64(len(body)) > c.config.MaxResponseBytes {
+		return "", fmt.Errorf("portal response exceeds %d bytes", c.config.MaxResponseBytes)
+	}
 	if resp.StatusCode >= http.StatusBadRequest {
-		return "", fmt.Errorf("portal http error %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", fmt.Errorf("portal request %s returned HTTP %d", u.Path, resp.StatusCode)
 	}
 	return string(body), nil
 }
@@ -209,7 +277,7 @@ func ParseJSONP(text string) (map[string]any, error) {
 		return parseJSONObject(text)
 	}
 
-	match := regexp.MustCompile(`^[^(]*\((.*)\)\s*;?$`).FindStringSubmatch(text)
+	match := jsonpPattern.FindStringSubmatch(text)
 	if len(match) < 2 {
 		if len(text) > 200 {
 			text = text[:200]
@@ -223,6 +291,9 @@ func parseJSONObject(text string) (map[string]any, error) {
 	var result map[string]any
 	if err := json.Unmarshal([]byte(text), &result); err != nil {
 		return nil, err
+	}
+	if result == nil {
+		return nil, errors.New("portal response must be a JSON object")
 	}
 	return result, nil
 }
@@ -286,14 +357,43 @@ func HMACMD5Hex(token, password string) string {
 }
 
 func OK(result map[string]any) bool {
-	errorMsg, hasErrorMsg := result["error_msg"].(string)
-	if hasErrorMsg && errorMsg != "" && errorMsg != "ok" && errorMsg != "login_ok" {
-		return false
-	}
-
 	sucMsg, _ := result["suc_msg"].(string)
 	errorValue, _ := result["error"].(string)
-	return sucMsg == "login_ok" || sucMsg == "ip_already_online_error" || errorValue == "ok"
+	if isDefinitiveSuccess(sucMsg) || isDefinitiveSuccess(errorValue) {
+		return true
+	}
+
+	errorMsg, _ := result["error_msg"].(string)
+	if errorMsg != "" && errorMsg != "ok" {
+		return false
+	}
+	return sucMsg == "ok" || errorValue == "ok"
+}
+
+func isDefinitiveSuccess(value string) bool {
+	return value == "login_ok" || value == "ip_already_online_error"
+}
+
+func defaultUserAgent() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 CampusLink/1"
+	case "darwin":
+		return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 CampusLink/1"
+	default:
+		return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 CampusLink/1"
+	}
+}
+
+func portalPlatform() (string, string) {
+	switch runtime.GOOS {
+	case "windows":
+		return "windows+10", "windows"
+	case "darwin":
+		return "mac", "mac"
+	default:
+		return "linux", "linux"
+	}
 }
 
 func nowMS() int64 {

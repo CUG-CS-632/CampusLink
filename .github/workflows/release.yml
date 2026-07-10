@@ -35,6 +35,9 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Race test
+        run: go test -race ./...
+
   build:
     name: Build release binaries
     runs-on: ubuntu-latest
@@ -76,9 +79,11 @@ jobs:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ github.event.inputs.tag || github.ref_name }}
+          COMMIT: ${{ github.sha }}
         run: |
           mkdir -p dist/${{ matrix.artifact }}
-          go build -trimpath -ldflags="-s -w" -o dist/${{ matrix.artifact }}/${{ matrix.binary }} ./cmd/campuslink
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" -o dist/${{ matrix.artifact }}/${{ matrix.binary }} ./cmd/campuslink
 
       - name: Package
         working-directory: dist

@@ -92,16 +92,42 @@ export SRUN_PASSWORD="密码"
 "$HOME/.local/bin/campuslink"
 ```
 
+还可以从标准输入读取密码，便于对接密码管理器或其他不会把密码放进进程参数的工具：
+
+```bash
+read -rsp "Campus network password: " CAMPUSLINK_PASSWORD
+printf '%s\n' "$CAMPUSLINK_PASSWORD" | env -u SRUN_PASSWORD "$HOME/.local/bin/campuslink" -u "学号" --password-stdin
+unset CAMPUSLINK_PASSWORD
+```
+
+查看当前版本：
+
+```bash
+"$HOME/.local/bin/campuslink" --version
+```
+
+Release 和 GitHub Actions 构建会同时显示版本号与 commit，例如 `campuslink v1.2.3 (commit abcdef123456)`。本地源码构建会读取 Go 嵌入的 Git 信息；工作区存在未提交改动时，commit 后会附加 `-dirty`。
+
 可配置项：
 
 | 环境变量 | 命令行参数 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `SRUN_USERNAME` | `-u, --username` | 无 | 校园网账号 |
 | `SRUN_PASSWORD` | `-p, --password` | 无 | 校园网密码 |
+| 无 | `--password-stdin` | 关闭 | 从标准输入读取密码，不能与其他密码来源同时使用 |
 | `SRUN_IP` | `--ip` | 自动发现 | 自动发现失败时手动指定客户端 IP |
-| `SRUN_HOST` | `--host` | `nap.cug.edu.cn` | SRun 网关域名 |
+| `SRUN_BASE_URL` | `--base-url` | `http://nap.cug.edu.cn` | SRun 网关完整基础 URL，优先于 `SRUN_HOST`，支持 HTTP/HTTPS |
+| `SRUN_HOST` | `--host` | `http://nap.cug.edu.cn` | 兼容旧配置；可以是网关域名、IP 或完整基础 URL |
 | `SRUN_AC_ID` | `--ac-id` | `1` | SRun 接入点 ID |
-| `SRUN_TIMEOUT` | `--timeout` | `8` | HTTP 超时时间，单位秒 |
+| `SRUN_TIMEOUT` | `--timeout` | `8` | HTTP 超时时间，单位秒，有效范围 1–3600；非法配置会直接报错 |
+
+如果网关提供有效的 HTTPS 服务，建议明确使用 HTTPS：
+
+```bash
+"$HOME/.local/bin/campuslink" --base-url "https://nap.cug.edu.cn"
+```
+
+没有协议前缀的 `--host` 值会按 HTTP 处理，以兼容原有配置。客户端会校验 URL、手动指定的 IP 和超时范围；网关响应最多读取 1 MiB，避免异常响应占用过多内存。
 
 ## 自动连接方案
 
@@ -286,8 +312,9 @@ launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/io.github.campuslink.sru
 
 ## GitHub CI
 
-- `go test ./...` 验证认证算法和 JSONP 解析。
+- `go test ./...` 验证认证算法、JSONP 解析、CLI 行为和模拟网关登录流程。
 - `go vet ./...` 做基础静态检查。
+- `go test -race ./...` 验证并发访问安全性；模拟网关测试覆盖 IP 发现、challenge、登录结果、超时、响应上限和错误脱敏。
 - `.github/workflows/build.yml` 用于普通 push、PR 和手动触发，交叉编译 Linux x64、Windows x64、macOS arm64，并上传 Actions artifacts。
 - `.github/workflows/release.yml` 只负责发版。推送 `v*` tag 会自动创建 GitHub Release，并上传三个系统的压缩包。
 - Release workflow 也支持手动触发，输入已有 tag 后会重新构建并补发对应 Release assets。
@@ -295,7 +322,10 @@ launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/io.github.campuslink.sru
 ## 安全说明
 
 - 不要把账号密码提交到 Git。
+- 命令行 `-p, --password` 可能出现在 shell 历史和进程列表中；交互使用优先选择环境变量，接入密码管理器时优先选择 `--password-stdin`。
 - Windows 用户级环境变量、Linux `EnvironmentFile`、macOS plist 都会在本机保存明文密码；请确保电脑账号本身有登录密码，并限制配置文件权限。
+- macOS plist 中的账号或密码如果包含 `&`、`<`、`>` 等字符，需要进行 XML 转义，否则 plist 无法加载。
+- 网络错误只记录请求路径和底层原因，不记录包含认证参数的完整 URL；`--json` 会主动输出网关原始响应，请避免把调试输出发送到公共日志。
 - 如果需要更强的凭据保护，后续可以扩展为从 Windows Credential Manager、Linux Secret Service 或 macOS Keychain 读取密码。
 
 ## 故障排查
@@ -339,3 +369,7 @@ launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/io.github.campuslink.sru
   ```
 
 - `login failed`：使用 `--json` 查看网关返回的原始错误，再确认账号、密码、`ac_id` 和学校网关地址。
+
+## 许可证
+
+CampusLink 使用 [MIT License](LICENSE)。
